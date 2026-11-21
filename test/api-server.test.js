@@ -1,6 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  AdapterPool,
+  AsyncMutex,
   createApiServer,
   extractPromptFromPayload,
   formatMessagesToPrompt,
@@ -69,6 +71,10 @@ class MockAdapterPool {
       adapter: this.adapter,
       provider: { id: providerId || "chatgpt", label: "ChatGPT" },
     };
+  }
+  async withAdapter(providerId, fn) {
+    const entry = await this.getAdapter(providerId);
+    return await fn(entry);
   }
   async closeAll() {}
 }
@@ -229,4 +235,103 @@ test("API server validates input and returns appropriate errors", async (t) => {
   });
   assert.equal(optionsRes.status, 204);
   assert.equal(optionsRes.headers.get("access-control-allow-origin"), "*");
+});
+
+test("AsyncMutex serializes concurrent execution", async () => {
+  const mutex = new AsyncMutex();
+  const sequence = [];
+
+  const task1 = mutex.runExclusive(async () => {
+    sequence.push("start-1");
+    await new Promise((r) => setTimeout(r, 20));
+    sequence.push("end-1");
+  });
+
+  const task2 = mutex.runExclusive(async () => {
+    sequence.push("start-2");
+    await new Promise((r) => setTimeout(r, 10));
+    sequence.push("end-2");
+  });
+
+  await Promise.all([task1, task2]);
+  assert.deepEqual(sequence, ["start-1", "end-1", "start-2", "end-2"]);
+});
+
+test("AdapterPool deduplicates concurrent adapter initialization", async () => {
+  let launchCount = 0;
+  class SlowMockAdapter {
+    async launch() {
+      launchCount += 1;
+      await new Promise((r) => setTimeout(r, 30));
+    }
+    async startConversation() {}
+    async close() {}
+  }
+
+  const pool = new AdapterPool({
+    adapterFactory: () => new SlowMockAdapter(),
+  });
+
+  // Call getAdapter concurrently for same model
+  const [res1, res2, res3] = await Promise.all([
+    pool.getAdapter("chatgpt"),
+    pool.getAdapter("chatgpt"),
+    pool.getAdapter("chatgpt"),
+  ]);
+
+  assert.equal(launchCount, 1, "Only a single adapter should be launched despite concurrent requests");
+  assert.equal(res1.adapter, res2.adapter);
+  assert.equal(res2.adapter, res3.adapter);
+  await pool.closeAll();
+});
+
+test("AdapterPool cleans up promise and closes adapter if launch or startConversation fails", async () => {
+  let fail = true;
+  let closedCount = 0;
+  class FailingMockAdapter {
+    async launch() {}
+    async startConversation() {
+      if (fail) throw new Error("Connection failed");
+    }
+    async close() {
+      closedCount += 1;
+    }
+  }
+
+  const pool = new AdapterPool({
+    adapterFactory: () => new FailingMockAdapter(),
+  });
+
+  await assert.rejects(
+    () => pool.getAdapter("chatgpt"),
+    /Connection failed/,
+  );
+  assert.equal(closedCount, 1, "Adapter should be closed on failure");
+
+  // Subsequent call after fix should succeed
+  fail = false;
+  const res = await pool.getAdapter("chatgpt");
+  assert.ok(res.adapter);
+  await pool.closeAll();
+});
+
+test("AdapterPool provides helpful error message if provider is unauthenticated", async () => {
+  class UnauthMockAdapter {
+    async launch() {}
+    async startConversation() {}
+    async getAuthState() {
+      return "unauthenticated";
+    }
+    async close() {}
+  }
+
+  const pool = new AdapterPool({
+    adapterFactory: () => new UnauthMockAdapter(),
+  });
+
+  await assert.rejects(
+    () => pool.getAdapter("deepseek"),
+    /DeepSeek is currently not logged in.*wtagent login --model deepseek/,
+  );
+  await pool.closeAll();
 });

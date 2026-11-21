@@ -75,6 +75,27 @@ export function cleanAssistantOutput(text) {
   return cleaned || text;
 }
 
+export class AsyncMutex {
+  constructor() {
+    this.queue = Promise.resolve();
+  }
+
+  async runExclusive(fn) {
+    let release;
+    const gate = new Promise((resolve) => {
+      release = resolve;
+    });
+    const prior = this.queue;
+    this.queue = gate;
+    await prior;
+    try {
+      return await fn();
+    } finally {
+      release();
+    }
+  }
+}
+
 export class AdapterPool {
   constructor({
     chromePath,
@@ -89,12 +110,20 @@ export class AdapterPool {
     this.debug = debug;
     this.adapterFactory = adapterFactory;
     this.adapters = new Map();
+    this.initPromises = new Map();
+    this.turnLocks = new Map();
   }
 
   async getAdapter(providerId) {
     const provider = resolveProvider(providerId || this.defaultProvider);
-    let entry = this.adapters.get(provider.id);
-    if (!entry) {
+    if (this.adapters.has(provider.id)) {
+      return this.adapters.get(provider.id);
+    }
+    if (this.initPromises.has(provider.id)) {
+      return await this.initPromises.get(provider.id);
+    }
+
+    const initPromise = (async () => {
       const appData = this.appDataDir ? path.resolve(this.appDataDir) : getAppDataDir();
       const profileDir = getProviderProfileDir(appData, provider.id);
 
@@ -104,12 +133,58 @@ export class AdapterPool {
         chromePath: this.chromePath,
         debug: this.debug,
       });
-      await adapter.launch();
-      await adapter.startConversation();
-      entry = { adapter, provider };
-      this.adapters.set(provider.id, entry);
+
+      try {
+        await adapter.launch();
+        await adapter.startConversation();
+
+        const authState = await adapter.getAuthState?.().catch(() => null);
+        if (authState === "unauthenticated") {
+          throw new Error(
+            `${provider.label} is currently not logged in (redirected to login). `
+            + `Please run 'wtagent login --model ${provider.id}' or log in in your browser.`,
+          );
+        }
+
+        const entry = { adapter, provider };
+        this.adapters.set(provider.id, entry);
+        return entry;
+      } catch (err) {
+        let enhancedError = err;
+        try {
+          const authState = await adapter.getAuthState?.().catch(() => null);
+          if (authState === "unauthenticated") {
+            enhancedError = new Error(
+              `${provider.label} is currently not logged in (redirected to login). `
+              + `Please run 'wtagent login --model ${provider.id}' or log in in your browser.`,
+            );
+          }
+        } catch {
+          // ignore auth inspection failure
+        }
+        try {
+          await adapter.close();
+        } catch {
+          // ignore close failures
+        }
+        throw enhancedError;
+      } finally {
+        this.initPromises.delete(provider.id);
+      }
+    })();
+
+    this.initPromises.set(provider.id, initPromise);
+    return await initPromise;
+  }
+
+  async withAdapter(providerId, fn) {
+    const entry = await this.getAdapter(providerId);
+    let mutex = this.turnLocks.get(entry.provider.id);
+    if (!mutex) {
+      mutex = new AsyncMutex();
+      this.turnLocks.set(entry.provider.id, mutex);
     }
-    return entry;
+    return await mutex.runExclusive(() => fn(entry));
   }
 
   async closeAll() {
@@ -121,6 +196,8 @@ export class AdapterPool {
       }
     }
     this.adapters.clear();
+    this.initPromises.clear();
+    this.turnLocks.clear();
   }
 }
 
@@ -265,69 +342,97 @@ export function createApiServer({
           return;
         }
 
-        let provider;
-        let adapter;
-        try {
-          const entry = await pool.getAdapter(modelId);
-          provider = entry.provider;
-          adapter = entry.adapter;
-        } catch (err) {
-          sendError(res, 400, err.message, "model_error");
-          return;
-        }
-
         const completionId = `chatcmpl-${crypto.randomUUID()}`;
         const created = Math.floor(Date.now() / 1000);
 
-        if (stream) {
-          res.writeHead(200, {
-            "Content-Type": "text/event-stream",
-            "Cache-Control": "no-cache",
-            Connection: "keep-alive",
-            "Access-Control-Allow-Origin": "*",
-          });
+        try {
+          await pool.withAdapter(modelId, async ({ adapter, provider }) => {
+            if (stream) {
+              res.writeHead(200, {
+                "Content-Type": "text/event-stream",
+                "Cache-Control": "no-cache",
+                Connection: "keep-alive",
+                "Access-Control-Allow-Origin": "*",
+              });
 
-          try {
-            await adapter.sendMessage(prompt);
-            await adapter.waitForTurnComplete({
-              timeoutMs: 120_000,
-              onDelta: (delta) => {
-                if (!delta) return;
-                const chunk = {
-                  id: completionId,
-                  object: "chat.completion.chunk",
-                  created,
-                  model: provider.id,
-                  choices: [
-                    {
-                      index: 0,
-                      delta: { content: delta },
-                      finish_reason: null,
-                    },
-                  ],
-                };
-                res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-              },
-            });
-
-            // Final stop chunk
-            const finalChunk = {
-              id: completionId,
-              object: "chat.completion.chunk",
-              created,
-              model: provider.id,
-              choices: [
-                {
-                  index: 0,
-                  delta: {},
-                  finish_reason: "stop",
+              await adapter.sendMessage(prompt);
+              await adapter.waitForTurnComplete({
+                timeoutMs: 120_000,
+                onDelta: (delta) => {
+                  if (!delta) return;
+                  const chunk = {
+                    id: completionId,
+                    object: "chat.completion.chunk",
+                    created,
+                    model: provider.id,
+                    choices: [
+                      {
+                        index: 0,
+                        delta: { content: delta },
+                        finish_reason: null,
+                      },
+                    ],
+                  };
+                  res.write(`data: ${JSON.stringify(chunk)}\n\n`);
                 },
-              ],
-            };
-            res.write(`data: ${JSON.stringify(finalChunk)}\n\n`);
-            res.write("data: [DONE]\n\n");
-            res.end();
-          } catch (err) {
+              });
+
+              // Final stop chunk
+              const finalChunk = {
+                id: completionId,
+                object: "chat.completion.chunk",
+                created,
+                model: provider.id,
+                choices: [
+                  {
+                    index: 0,
+                    delta: {},
+                    finish_reason: "stop",
+                  },
+                ],
+              };
+              res.write(`data: ${JSON.stringify(finalChunk)}\n\n`);
+              res.write("data: [DONE]\n\n");
+              res.end();
+            } else {
+              await adapter.sendMessage(prompt);
+              let fullText = "";
+              const turnResult = await adapter.waitForTurnComplete({
+                timeoutMs: 120_000,
+                onDelta: (delta) => {
+                  fullText += delta;
+                },
+              });
+
+              const replyText = cleanAssistantOutput(turnResult?.text || fullText);
+
+              sendJson(res, 200, {
+                id: completionId,
+                object: "chat.completion",
+                created,
+                model: provider.id,
+                choices: [
+                  {
+                    index: 0,
+                    message: {
+                      role: "assistant",
+                      content: replyText,
+                    },
+                    finish_reason: "stop",
+                  },
+                ],
+                usage: {
+                  prompt_tokens: prompt.length,
+                  completion_tokens: replyText.length,
+                  total_tokens: prompt.length + replyText.length,
+                },
+              });
+            }
+          });
+        } catch (err) {
+          if (!res.headersSent) {
+            sendError(res, 400, err.message, "model_error");
+          } else {
             const errorChunk = {
               error: {
                 message: err.message,
@@ -336,44 +441,6 @@ export function createApiServer({
             };
             res.write(`data: ${JSON.stringify(errorChunk)}\n\n`);
             res.end();
-          }
-        } else {
-          // Non-streaming
-          try {
-            await adapter.sendMessage(prompt);
-            let fullText = "";
-            const turnResult = await adapter.waitForTurnComplete({
-              timeoutMs: 120_000,
-              onDelta: (delta) => {
-                fullText += delta;
-              },
-            });
-
-            const replyText = cleanAssistantOutput(turnResult?.text || fullText);
-
-            sendJson(res, 200, {
-              id: completionId,
-              object: "chat.completion",
-              created,
-              model: provider.id,
-              choices: [
-                {
-                  index: 0,
-                  message: {
-                    role: "assistant",
-                    content: replyText,
-                  },
-                  finish_reason: "stop",
-                },
-              ],
-              usage: {
-                prompt_tokens: prompt.length,
-                completion_tokens: replyText.length,
-                total_tokens: prompt.length + replyText.length,
-              },
-            });
-          } catch (err) {
-            sendError(res, 500, err.message, "turn_error");
           }
         }
       });
@@ -465,84 +532,131 @@ export function createApiServer({
           return;
         }
 
-        let provider;
-        let adapter;
-        try {
-          const entry = await pool.getAdapter(modelId);
-          provider = entry.provider;
-          adapter = entry.adapter;
-        } catch (err) {
-          sendError(res, 400, err.message, "model_error");
-          return;
-        }
-
         const responseId = `resp_${crypto.randomUUID()}`;
         const itemId = `item_${crypto.randomUUID()}`;
 
-        if (stream) {
-          res.writeHead(200, {
-            "Content-Type": "text/event-stream",
-            "Cache-Control": "no-cache",
-            Connection: "keep-alive",
-            "Access-Control-Allow-Origin": "*",
-          });
+        try {
+          await pool.withAdapter(modelId, async ({ adapter, provider }) => {
+            if (stream) {
+              res.writeHead(200, {
+                "Content-Type": "text/event-stream",
+                "Cache-Control": "no-cache",
+                Connection: "keep-alive",
+                "Access-Control-Allow-Origin": "*",
+              });
 
-          res.write(`event: response.output_item.added\ndata: ${JSON.stringify({
-            type: "response.output_item.added",
-            response_id: responseId,
-            output_index: 0,
-            item: {
-              id: itemId,
-              type: "message",
-              role: "assistant",
-              content: [],
-            },
-          })}\n\n`);
+              res.write(`event: response.output_item.added\ndata: ${JSON.stringify({
+                type: "response.output_item.added",
+                response_id: responseId,
+                output_index: 0,
+                item: {
+                  id: itemId,
+                  type: "message",
+                  role: "assistant",
+                  content: [],
+                },
+              })}\n\n`);
 
-          res.write(`event: response.content_part.added\ndata: ${JSON.stringify({
-            type: "response.content_part.added",
-            response_id: responseId,
-            item_id: itemId,
-            output_index: 0,
-            content_index: 0,
-            part: {
-              type: "output_text",
-              text: "",
-            },
-          })}\n\n`);
+              res.write(`event: response.content_part.added\ndata: ${JSON.stringify({
+                type: "response.content_part.added",
+                response_id: responseId,
+                item_id: itemId,
+                output_index: 0,
+                content_index: 0,
+                part: {
+                  type: "output_text",
+                  text: "",
+                },
+              })}\n\n`);
 
-          let fullText = "";
-          try {
-            await adapter.sendMessage(prompt);
-            await adapter.waitForTurnComplete({
-              timeoutMs: 120_000,
-              onDelta: (delta) => {
-                if (!delta) return;
-                fullText += delta;
-                res.write(`event: response.output_text.delta\ndata: ${JSON.stringify({
-                  type: "response.output_text.delta",
-                  response_id: responseId,
-                  item_id: itemId,
-                  output_index: 0,
-                  content_index: 0,
-                  delta,
-                })}\n\n`);
-              },
-            });
+              let fullText = "";
+              await adapter.sendMessage(prompt);
+              await adapter.waitForTurnComplete({
+                timeoutMs: 120_000,
+                onDelta: (delta) => {
+                  if (!delta) return;
+                  fullText += delta;
+                  res.write(`event: response.output_text.delta\ndata: ${JSON.stringify({
+                    type: "response.output_text.delta",
+                    response_id: responseId,
+                    item_id: itemId,
+                    output_index: 0,
+                    content_index: 0,
+                    delta,
+                  })}\n\n`);
+                },
+              });
 
-            res.write(`event: response.output_text.done\ndata: ${JSON.stringify({
-              type: "response.output_text.done",
-              response_id: responseId,
-              item_id: itemId,
-              output_index: 0,
-              content_index: 0,
-              text: fullText,
-            })}\n\n`);
+              res.write(`event: response.output_text.done\ndata: ${JSON.stringify({
+                type: "response.output_text.done",
+                response_id: responseId,
+                item_id: itemId,
+                output_index: 0,
+                content_index: 0,
+                text: fullText,
+              })}\n\n`);
 
-            res.write(`event: response.completed\ndata: ${JSON.stringify({
-              type: "response.completed",
-              response: {
+              res.write(`event: response.content_part.done\ndata: ${JSON.stringify({
+                type: "response.content_part.done",
+                response_id: responseId,
+                item_id: itemId,
+                output_index: 0,
+                content_index: 0,
+                part: {
+                  type: "output_text",
+                  text: fullText,
+                },
+              })}\n\n`);
+
+              res.write(`event: response.output_item.done\ndata: ${JSON.stringify({
+                type: "response.output_item.done",
+                response_id: responseId,
+                output_index: 0,
+                item: {
+                  id: itemId,
+                  type: "message",
+                  role: "assistant",
+                  status: "completed",
+                  content: [{ type: "output_text", text: fullText }],
+                },
+              })}\n\n`);
+
+              res.write(`event: response.completed\ndata: ${JSON.stringify({
+                type: "response.completed",
+                response: {
+                  id: responseId,
+                  status: "completed",
+                  model: provider.id,
+                  output: [
+                    {
+                      id: itemId,
+                      type: "message",
+                      role: "assistant",
+                      content: [
+                        {
+                          type: "output_text",
+                          text: fullText,
+                        },
+                      ],
+                    },
+                  ],
+                },
+              })}\n\n`);
+              res.end();
+            } else {
+              await adapter.sendMessage(prompt);
+              let fullText = "";
+              const turnResult = await adapter.waitForTurnComplete({
+                timeoutMs: 120_000,
+                onDelta: (delta) => {
+                  fullText += delta;
+                },
+              });
+              const replyText = cleanAssistantOutput(turnResult?.text || fullText);
+
+              sendJson(res, 200, {
                 id: responseId,
+                object: "response",
                 status: "completed",
                 model: provider.id,
                 output: [
@@ -553,53 +667,22 @@ export function createApiServer({
                     content: [
                       {
                         type: "output_text",
-                        text: fullText,
+                        text: replyText,
                       },
                     ],
                   },
                 ],
-              },
-            })}\n\n`);
-            res.end();
-          } catch (err) {
+              });
+            }
+          });
+        } catch (err) {
+          if (!res.headersSent) {
+            sendError(res, 400, err.message, "model_error");
+          } else {
             res.write(`event: error\ndata: ${JSON.stringify({
               error: { message: err.message, type: "turn_error" },
             })}\n\n`);
             res.end();
-          }
-        } else {
-          try {
-            await adapter.sendMessage(prompt);
-            let fullText = "";
-            const turnResult = await adapter.waitForTurnComplete({
-              timeoutMs: 120_000,
-              onDelta: (delta) => {
-                fullText += delta;
-              },
-            });
-            const replyText = cleanAssistantOutput(turnResult?.text || fullText);
-
-            sendJson(res, 200, {
-              id: responseId,
-              object: "response",
-              status: "completed",
-              model: provider.id,
-              output: [
-                {
-                  id: itemId,
-                  type: "message",
-                  role: "assistant",
-                  content: [
-                    {
-                      type: "output_text",
-                      text: replyText,
-                    },
-                  ],
-                },
-              ],
-            });
-          } catch (err) {
-            sendError(res, 500, err.message, "turn_error");
           }
         }
       });
