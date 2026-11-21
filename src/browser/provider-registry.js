@@ -5,6 +5,7 @@ import { GeminiWebAdapter } from "./gemini-web-adapter.js";
 import { GrokWebAdapter } from "./grok-web-adapter.js";
 import { KimiWebAdapter } from "./kimi-web-adapter.js";
 import { GLMWebAdapter } from "./glm-web-adapter.js";
+import { MistralWebAdapter } from "./mistral-web-adapter.js";
 import { getProfileDir } from "../platform/paths.js";
 
 // Single source of truth for the web-AI providers WTAgent can drive. The CLI,
@@ -84,6 +85,14 @@ export const PROVIDERS = Object.freeze({
     profileBasename: "gemini-profile",
     status: "active",
     adapter: GeminiWebAdapter,
+  }),
+  mistral: Object.freeze({
+    id: "mistral",
+    label: "Mistral",
+    baseUrl: "https://chat.mistral.ai/",
+    profileBasename: "mistral-profile",
+    status: "active",
+    adapter: MistralWebAdapter,
   }),
 });
 
