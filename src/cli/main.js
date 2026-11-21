@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { Command } from "commander";
 import { confirm, select } from "@inquirer/prompts";
 import { launchNativeLoginBrowser } from "../browser/native-login.js";
+import { createApiServer } from "../server/api-server.js";
 import {
   createWebAdapter,
   DEFAULT_PROVIDER,
@@ -1046,6 +1047,33 @@ const program = new Command()
   .argument("[task...]", t("argument.task"))
   .action(async (task, _, command) => {
     await runAgent(task, command.optsWithGlobals());
+  });
+
+async function runServe(options) {
+  assertNativeRuntimeSupported();
+  const port = options.port ?? 8080;
+  const host = options.host ?? "127.0.0.1";
+  const server = createApiServer({
+    port,
+    host,
+    defaultProvider: options.model ?? DEFAULT_PROVIDER,
+    chromePath: options.chromePath,
+    appDataDir: options.home,
+  });
+  await server.listen();
+  console.log(`WTAgent OpenAI-compatible API server listening on http://${host}:${port}`);
+  console.log(`Chat completions endpoint: http://${host}:${port}/v1/chat/completions`);
+  console.log(`Models endpoint:           http://${host}:${port}/v1/models`);
+}
+
+program
+  .command("serve")
+  .alias("api")
+  .description("Start a local OpenAI-compatible API server")
+  .option("-p, --port <number>", "Port to listen on", (val) => parseInt(val, 10), 8080)
+  .option("-H, --host <address>", "Host to bind to", "127.0.0.1")
+  .action(async (options, command) => {
+    await runServe({ ...command.optsWithGlobals(), ...options });
   });
 
 program

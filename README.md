@@ -45,6 +45,30 @@ wtagent --model claude "inspect this project and summarize its architecture"
 wtagent --model gemini "inspect this project and summarize its architecture"
 ```
 
+### Local OpenAI-compatible API server
+
+Start a local HTTP server that exposes WTAgent's web providers as an OpenAI-compatible API for external tools (OpenCode, Cursor, Continue, or curl):
+
+```bash
+# Start API server on http://127.0.0.1:8080 (default model: chatgpt)
+wtagent serve
+
+# Or customize port, host, and default model
+wtagent serve --port 8080 --model claude
+```
+
+Call it like any OpenAI endpoint:
+
+```bash
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude",
+    "messages": [{"role": "user", "content": "Hello!"}],
+    "stream": true
+  }'
+```
+
 ### Generate and save images
 
 Use ChatGPT, Gemini, or Grok to generate images in the current conversation. No
