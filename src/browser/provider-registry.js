@@ -5,6 +5,7 @@ import { GeminiWebAdapter } from "./gemini-web-adapter.js";
 import { GrokWebAdapter } from "./grok-web-adapter.js";
 import { KimiWebAdapter } from "./kimi-web-adapter.js";
 import { GLMWebAdapter } from "./glm-web-adapter.js";
+import { MetaWebAdapter } from "./meta-web-adapter.js";
 import { getProfileDir } from "../platform/paths.js";
 
 // Single source of truth for the web-AI providers WTAgent can drive. The CLI,
@@ -84,6 +85,14 @@ export const PROVIDERS = Object.freeze({
     profileBasename: "gemini-profile",
     status: "active",
     adapter: GeminiWebAdapter,
+  }),
+  meta: Object.freeze({
+    id: "meta",
+    label: "Meta AI",
+    baseUrl: "https://www.meta.ai/",
+    profileBasename: "meta-profile",
+    status: "active",
+    adapter: MetaWebAdapter,
   }),
 });
 
