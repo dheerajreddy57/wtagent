@@ -13,6 +13,7 @@ import {
 } from "../src/browser/provider-registry.js";
 import { ChatGPTWebAdapter } from "../src/browser/chatgpt-web-adapter.js";
 import { ClaudeWebAdapter } from "../src/browser/claude-web-adapter.js";
+import { CopilotWebAdapter } from "../src/browser/copilot-web-adapter.js";
 import { GeminiWebAdapter } from "../src/browser/gemini-web-adapter.js";
 import { GrokWebAdapter } from "../src/browser/grok-web-adapter.js";
 
@@ -44,17 +45,18 @@ test("resolveProvider rejects an unknown model with the known list", () => {
   );
 });
 
-test("claude, deepseek, gemini, kimi, and glm are active with working adapters", () => {
-  for (const id of ["claude", "deepseek", "gemini", "grok", "kimi", "glm"]) {
+test("claude, copilot, deepseek, gemini, kimi, and glm are active with working adapters", () => {
+  for (const id of ["claude", "copilot", "deepseek", "gemini", "grok", "kimi", "glm"]) {
     assert.equal(PROVIDERS[id].status, "active");
     assert.ok(PROVIDERS[id].adapter, id + " should have an adapter");
     assert.equal(resolveProvider(id).id, id);
   }
   assert.deepEqual(
     listActiveProviderIds().sort(),
-    ["chatgpt", "claude", "deepseek", "gemini", "glm", "grok", "kimi"],
+    ["chatgpt", "claude", "copilot", "deepseek", "gemini", "glm", "grok", "kimi"],
   );
   assert.equal(PROVIDERS.grok.adapter, GrokWebAdapter);
+  assert.equal(PROVIDERS.copilot.adapter, CopilotWebAdapter);
 });
 
 test("getProvider returns registered providers but rejects unknown", () => {
