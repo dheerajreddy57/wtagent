@@ -61,6 +61,20 @@ export function normalizeModelId(model, defaultProvider = DEFAULT_PROVIDER) {
   return raw;
 }
 
+export function isTitleGenerationRequest(payload) {
+  const prompt = extractPromptFromPayload(payload);
+  return Boolean(
+    /title generator|generate a (short )?(thread )?title|title for (this|the) conversation/i.test(prompt)
+  );
+}
+
+export function cleanAssistantOutput(text) {
+  if (!text) return "";
+  let cleaned = text.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
+  cleaned = cleaned.replace(/^Thinking Process:[\s\S]*?(?=\n\n(?:[A-Z]|#|\*|\d|-|Hello|Hi))/i, "").trim();
+  return cleaned || text;
+}
+
 export class AdapterPool {
   constructor({
     chromePath,
@@ -217,6 +231,40 @@ export function createApiServer({
         const stream = Boolean(payload.stream);
         const modelId = normalizeModelId(payload.model, defaultProvider);
 
+        if (isTitleGenerationRequest(payload)) {
+          const title = "New Chat";
+          const completionId = `chatcmpl-${crypto.randomUUID()}`;
+          const created = Math.floor(Date.now() / 1000);
+          if (stream) {
+            res.writeHead(200, {
+              "Content-Type": "text/event-stream",
+              "Cache-Control": "no-cache",
+              Connection: "keep-alive",
+              "Access-Control-Allow-Origin": "*",
+            });
+            const chunk = {
+              id: completionId,
+              object: "chat.completion.chunk",
+              created,
+              model: modelId,
+              choices: [{ index: 0, delta: { content: title }, finish_reason: null }],
+            };
+            res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+            res.write(`data: ${JSON.stringify({ ...chunk, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`);
+            res.write("data: [DONE]\n\n");
+            res.end();
+            return;
+          }
+          sendJson(res, 200, {
+            id: completionId,
+            object: "chat.completion",
+            created,
+            model: modelId,
+            choices: [{ index: 0, message: { role: "assistant", content: title }, finish_reason: "stop" }],
+          });
+          return;
+        }
+
         let provider;
         let adapter;
         try {
@@ -301,7 +349,7 @@ export function createApiServer({
               },
             });
 
-            const replyText = turnResult?.text || fullText;
+            const replyText = cleanAssistantOutput(turnResult?.text || fullText);
 
             sendJson(res, 200, {
               id: completionId,
@@ -361,6 +409,61 @@ export function createApiServer({
 
         const stream = Boolean(payload.stream);
         const modelId = normalizeModelId(payload.model, defaultProvider);
+
+        if (isTitleGenerationRequest(payload)) {
+          const title = "New Chat";
+          const responseId = `resp_${crypto.randomUUID()}`;
+          const itemId = `item_${crypto.randomUUID()}`;
+          if (stream) {
+            res.writeHead(200, {
+              "Content-Type": "text/event-stream",
+              "Cache-Control": "no-cache",
+              Connection: "keep-alive",
+              "Access-Control-Allow-Origin": "*",
+            });
+            res.write(`event: response.output_item.added\ndata: ${JSON.stringify({
+              type: "response.output_item.added",
+              response_id: responseId,
+              output_index: 0,
+              item: { id: itemId, type: "message", role: "assistant", content: [] },
+            })}\n\n`);
+            res.write(`event: response.output_text.delta\ndata: ${JSON.stringify({
+              type: "response.output_text.delta",
+              response_id: responseId,
+              item_id: itemId,
+              output_index: 0,
+              content_index: 0,
+              delta: title,
+            })}\n\n`);
+            res.write(`event: response.output_text.done\ndata: ${JSON.stringify({
+              type: "response.output_text.done",
+              response_id: responseId,
+              item_id: itemId,
+              output_index: 0,
+              content_index: 0,
+              text: title,
+            })}\n\n`);
+            res.write(`event: response.completed\ndata: ${JSON.stringify({
+              type: "response.completed",
+              response: {
+                id: responseId,
+                status: "completed",
+                model: modelId,
+                output: [{ id: itemId, type: "message", role: "assistant", content: [{ type: "output_text", text: title }] }],
+              },
+            })}\n\n`);
+            res.end();
+            return;
+          }
+          sendJson(res, 200, {
+            id: responseId,
+            object: "response",
+            status: "completed",
+            model: modelId,
+            output: [{ id: itemId, type: "message", role: "assistant", content: [{ type: "output_text", text: title }] }],
+          });
+          return;
+        }
 
         let provider;
         let adapter;
@@ -474,7 +577,7 @@ export function createApiServer({
                 fullText += delta;
               },
             });
-            const replyText = turnResult?.text || fullText;
+            const replyText = cleanAssistantOutput(turnResult?.text || fullText);
 
             sendJson(res, 200, {
               id: responseId,
