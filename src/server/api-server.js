@@ -26,6 +26,41 @@ export function formatMessagesToPrompt(messages) {
     .join("\n\n");
 }
 
+export function extractPromptFromPayload(payload) {
+  if (Array.isArray(payload.messages) && payload.messages.length > 0) {
+    return formatMessagesToPrompt(payload.messages);
+  }
+  if (typeof payload.input === "string") {
+    return payload.input.trim();
+  }
+  if (Array.isArray(payload.input) && payload.input.length > 0) {
+    return payload.input
+      .map((item) => {
+        if (typeof item === "string") return item;
+        const role = item.role || "user";
+        let content = "";
+        if (typeof item.content === "string") {
+          content = item.content;
+        } else if (Array.isArray(item.content)) {
+          content = item.content.map((c) => c.text || c.input_text || "").filter(Boolean).join(" ");
+        }
+        return `${role}: ${content}`;
+      })
+      .filter(Boolean)
+      .join("\n\n");
+  }
+  return "";
+}
+
+export function normalizeModelId(model, defaultProvider = DEFAULT_PROVIDER) {
+  let raw = model || defaultProvider;
+  if (typeof raw === "string") {
+    if (raw.includes("/")) raw = raw.split("/").pop();
+    if (raw.includes(":")) raw = raw.split(":").pop();
+  }
+  return raw;
+}
+
 export class AdapterPool {
   constructor({
     chromePath,
@@ -118,6 +153,7 @@ export function createApiServer({
 
     const url = new URL(req.url, `http://${req.headers.host || "127.0.0.1"}`);
     const pathname = url.pathname.replace(/\/+$/, "") || "/";
+    console.log(`[WTAgent API] ${req.method} ${pathname}`);
 
     // Health check
     if (pathname === "/" || pathname === "/health") {
@@ -179,7 +215,7 @@ export function createApiServer({
         }
 
         const stream = Boolean(payload.stream);
-        const modelId = payload.model || defaultProvider;
+        const modelId = normalizeModelId(payload.model, defaultProvider);
 
         let provider;
         let adapter;
@@ -287,6 +323,177 @@ export function createApiServer({
                 completion_tokens: replyText.length,
                 total_tokens: prompt.length + replyText.length,
               },
+            });
+          } catch (err) {
+            sendError(res, 500, err.message, "turn_error");
+          }
+        }
+      });
+      return;
+    }
+
+    // Responses API (OpenAI Responses format used by newer AI SDKs)
+    if (pathname === "/v1/responses" || pathname === "/responses" || pathname.endsWith("/responses")) {
+      if (req.method !== "POST") {
+        sendError(res, 405, "Method Not Allowed");
+        return;
+      }
+
+      let body = "";
+      req.on("data", (chunk) => {
+        body += chunk;
+      });
+
+      req.on("end", async () => {
+        let payload;
+        try {
+          payload = JSON.parse(body || "{}");
+        } catch {
+          sendError(res, 400, "Invalid JSON in request body");
+          return;
+        }
+
+        const prompt = extractPromptFromPayload(payload);
+        if (!prompt) {
+          sendError(res, 400, "Request contained no input text or messages");
+          return;
+        }
+
+        const stream = Boolean(payload.stream);
+        const modelId = normalizeModelId(payload.model, defaultProvider);
+
+        let provider;
+        let adapter;
+        try {
+          const entry = await pool.getAdapter(modelId);
+          provider = entry.provider;
+          adapter = entry.adapter;
+        } catch (err) {
+          sendError(res, 400, err.message, "model_error");
+          return;
+        }
+
+        const responseId = `resp_${crypto.randomUUID()}`;
+        const itemId = `item_${crypto.randomUUID()}`;
+
+        if (stream) {
+          res.writeHead(200, {
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            Connection: "keep-alive",
+            "Access-Control-Allow-Origin": "*",
+          });
+
+          res.write(`event: response.output_item.added\ndata: ${JSON.stringify({
+            type: "response.output_item.added",
+            response_id: responseId,
+            output_index: 0,
+            item: {
+              id: itemId,
+              type: "message",
+              role: "assistant",
+              content: [],
+            },
+          })}\n\n`);
+
+          res.write(`event: response.content_part.added\ndata: ${JSON.stringify({
+            type: "response.content_part.added",
+            response_id: responseId,
+            item_id: itemId,
+            output_index: 0,
+            content_index: 0,
+            part: {
+              type: "output_text",
+              text: "",
+            },
+          })}\n\n`);
+
+          let fullText = "";
+          try {
+            await adapter.sendMessage(prompt);
+            await adapter.waitForTurnComplete({
+              timeoutMs: 120_000,
+              onDelta: (delta) => {
+                if (!delta) return;
+                fullText += delta;
+                res.write(`event: response.output_text.delta\ndata: ${JSON.stringify({
+                  type: "response.output_text.delta",
+                  response_id: responseId,
+                  item_id: itemId,
+                  output_index: 0,
+                  content_index: 0,
+                  delta,
+                })}\n\n`);
+              },
+            });
+
+            res.write(`event: response.output_text.done\ndata: ${JSON.stringify({
+              type: "response.output_text.done",
+              response_id: responseId,
+              item_id: itemId,
+              output_index: 0,
+              content_index: 0,
+              text: fullText,
+            })}\n\n`);
+
+            res.write(`event: response.completed\ndata: ${JSON.stringify({
+              type: "response.completed",
+              response: {
+                id: responseId,
+                status: "completed",
+                model: provider.id,
+                output: [
+                  {
+                    id: itemId,
+                    type: "message",
+                    role: "assistant",
+                    content: [
+                      {
+                        type: "output_text",
+                        text: fullText,
+                      },
+                    ],
+                  },
+                ],
+              },
+            })}\n\n`);
+            res.end();
+          } catch (err) {
+            res.write(`event: error\ndata: ${JSON.stringify({
+              error: { message: err.message, type: "turn_error" },
+            })}\n\n`);
+            res.end();
+          }
+        } else {
+          try {
+            await adapter.sendMessage(prompt);
+            let fullText = "";
+            const turnResult = await adapter.waitForTurnComplete({
+              timeoutMs: 120_000,
+              onDelta: (delta) => {
+                fullText += delta;
+              },
+            });
+            const replyText = turnResult?.text || fullText;
+
+            sendJson(res, 200, {
+              id: responseId,
+              object: "response",
+              status: "completed",
+              model: provider.id,
+              output: [
+                {
+                  id: itemId,
+                  type: "message",
+                  role: "assistant",
+                  content: [
+                    {
+                      type: "output_text",
+                      text: replyText,
+                    },
+                  ],
+                },
+              ],
             });
           } catch (err) {
             sendError(res, 500, err.message, "turn_error");

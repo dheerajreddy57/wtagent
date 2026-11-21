@@ -2,8 +2,22 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   createApiServer,
+  extractPromptFromPayload,
   formatMessagesToPrompt,
+  normalizeModelId,
 } from "../src/server/api-server.js";
+
+test("extractPromptFromPayload extracts text from string or arrays", () => {
+  assert.equal(extractPromptFromPayload({ input: "simple query" }), "simple query");
+  assert.equal(
+    extractPromptFromPayload({
+      input: [{ role: "user", content: [{ type: "input_text", text: "what is node?" }] }],
+    }),
+    "user: what is node?",
+  );
+  assert.equal(normalizeModelId("wtagent/chatgpt"), "chatgpt");
+  assert.equal(normalizeModelId("custom:claude"), "claude");
+});
 
 test("formatMessagesToPrompt formats single and multiple messages", () => {
   assert.equal(formatMessagesToPrompt([]), "");
@@ -132,6 +146,46 @@ test("API server handles streaming chat completions (SSE)", async (t) => {
   assert.ok(text.includes('"delta":{"content":"Hello "}'));
   assert.ok(text.includes('"delta":{"content":"WTAgent!"}'));
   assert.ok(text.includes("data: [DONE]"));
+});
+
+test("API server handles /v1/responses endpoint", async (t) => {
+  const pool = new MockAdapterPool();
+  const api = createApiServer({ adapterPool: pool });
+  const addr = await api.listen(0, "127.0.0.1");
+  const baseUrl = `http://127.0.0.1:${addr.port}`;
+  t.after(() => api.close());
+
+  // Non-streaming
+  const res = await fetch(`${baseUrl}/v1/responses`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "wtagent/chatgpt",
+      input: "hi there",
+      stream: false,
+    }),
+  });
+  assert.equal(res.status, 200);
+  const data = await res.json();
+  assert.equal(data.object, "response");
+  assert.equal(data.status, "completed");
+  assert.equal(data.output[0].content[0].text, "Hello from WTAgent mock adapter!");
+
+  // Streaming
+  const streamRes = await fetch(`${baseUrl}/v1/responses`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "wtagent/chatgpt",
+      input: "hi there",
+      stream: true,
+    }),
+  });
+  assert.equal(streamRes.status, 200);
+  const streamText = await streamRes.text();
+  assert.ok(streamText.includes("event: response.output_item.added"));
+  assert.ok(streamText.includes("event: response.output_text.delta"));
+  assert.ok(streamText.includes("event: response.completed"));
 });
 
 test("API server validates input and returns appropriate errors", async (t) => {
