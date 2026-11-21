@@ -1,12 +1,14 @@
 import http from "node:http";
 import crypto from "node:crypto";
+import path from "node:path";
 import {
   createWebAdapter,
   DEFAULT_PROVIDER,
+  getProviderProfileDir,
   listActiveProviderIds,
   resolveProvider,
 } from "../browser/provider-registry.js";
-import { getProfileDir } from "../platform/paths.js";
+import { getAppDataDir } from "../platform/paths.js";
 
 export function formatMessagesToPrompt(messages) {
   if (!Array.isArray(messages) || messages.length === 0) {
@@ -44,9 +46,8 @@ export class AdapterPool {
     const provider = resolveProvider(providerId || this.defaultProvider);
     let entry = this.adapters.get(provider.id);
     if (!entry) {
-      const profileDir = this.appDataDir
-        ? getProfileDir(this.appDataDir, provider.profileBasename)
-        : undefined;
+      const appData = this.appDataDir ? path.resolve(this.appDataDir) : getAppDataDir();
+      const profileDir = getProviderProfileDir(appData, provider.id);
 
       const adapter = this.adapterFactory({
         provider,
