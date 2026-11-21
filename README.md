@@ -45,6 +45,19 @@ wtagent --model claude "inspect this project and summarize its architecture"
 wtagent --model gemini "inspect this project and summarize its architecture"
 ```
 
+### Automatic cookie import
+
+Import session cookies from your existing desktop browser (Chrome, Brave, Edge, Arc, Chromium) so you don't have to sign in manually:
+
+```bash
+# Auto-detect cookies from your default desktop browser
+wtagent login --import
+
+# Or specify a provider and browser explicitly
+wtagent login --model claude --import chrome
+wtagent login --model deepseek --import brave
+```
+
 ### Generate and save images
 
 Use ChatGPT, Gemini, or Grok to generate images in the current conversation. No

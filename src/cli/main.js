@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { Command } from "commander";
 import { confirm, select } from "@inquirer/prompts";
 import { launchNativeLoginBrowser } from "../browser/native-login.js";
+import { importCookiesFromBrowser } from "../browser/cookie-importer.js";
 import {
   createWebAdapter,
   DEFAULT_PROVIDER,
@@ -83,6 +84,39 @@ async function runLogin(options) {
   const provider = resolveProvider(options.model ?? DEFAULT_PROVIDER);
   const { profileDir } = resolveRuntimePaths(options, provider.id);
   const { label, baseUrl } = provider;
+
+  const importTarget = options.import ?? options.importCookies;
+  if (importTarget != null && importTarget !== false) {
+    const browserChoice = typeof importTarget === "string" && importTarget.trim() ? importTarget.trim() : "auto";
+    console.log(`Importing cookies from ${browserChoice === "auto" ? "desktop browser" : browserChoice}...`);
+    try {
+      const result = await importCookiesFromBrowser({
+        sourceBrowser: browserChoice,
+        destinationProfileDir: profileDir,
+      });
+      console.log(`Imported cookies from ${result.browser} into profile.`);
+
+      const verifier = createWebAdapter({
+        provider,
+        profileDir,
+        chromePath: options.chromePath,
+      });
+      try {
+        await verifier.launch();
+        let authenticated = await verifier.getAuthState() === "authenticated";
+        if (authenticated) {
+          console.log(t("login.verified", { provider: label }));
+          return;
+        }
+      } finally {
+        await verifier.close();
+      }
+      console.log(`Imported cookies from ${result.browser}, but ${label} requires completing sign-in in browser.`);
+    } catch (err) {
+      console.warn(`Cookie import notice: ${err.message}`);
+    }
+  }
+
   for (;;) {
     console.log(t("login.openingProfile", { profileDir }));
     console.log(t("login.finishSignIn", { provider: label }));
@@ -1043,6 +1077,8 @@ const program = new Command()
   .option("--model-turn-timeout-ms <milliseconds>", t("option.timeout"))
   .option("--no-minimize", t("option.noMinimize"))
   .option("--debug", t("option.debug"), false)
+  .option("--import [browser]", "Import cookies and session from an existing desktop browser (chrome, brave, edge, arc, chromium)")
+  .option("--import-cookies [browser]", "Alias for --import")
   .argument("[task...]", t("argument.task"))
   .action(async (task, _, command) => {
     await runAgent(task, command.optsWithGlobals());
@@ -1061,7 +1097,9 @@ program
 program
   .command("login")
   .description(t("command.login"))
-  .action(async (_, command) => runLogin(command.optsWithGlobals()));
+  .option("--import [browser]", "Import cookies and session from an existing desktop browser (chrome, brave, edge, arc, chromium)")
+  .option("--import-cookies [browser]", "Alias for --import")
+  .action(async (options, command) => runLogin({ ...command.optsWithGlobals(), ...options }));
 
 program
   .command("logout")
