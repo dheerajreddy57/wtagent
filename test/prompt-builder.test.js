@@ -126,3 +126,34 @@ test("resume prompt treats a follow-up as the next message in an open session", 
   assert.match(web, /next message in the same open conversation/);
   assert.doesNotMatch(web, /previous_status|completed\/done status/);
 });
+
+test("bootstrap prompt includes thought reasoning guidance and batch tool instructions", () => {
+  const { web } = buildBootstrapPrompt({
+    task: "Implement the feature.",
+    projectRoot: "/project",
+    tools,
+  });
+
+  assert.match(web, /<thought>/);
+  assert.match(web, /batch multiple independent tools in a single turn/);
+});
+
+test("bootstrap prompt injects environment map into scaffold", () => {
+  const { web } = buildBootstrapPrompt({
+    task: "Implement the feature.",
+    projectRoot: "/project",
+    tools,
+    environmentMap: {
+      stack: "Node.js (ESM)",
+      packageManager: "npm",
+      git: { branch: "feature-branch", commit: "abcdef1", status: "clean" },
+      structure: ["src/", "test/", "package.json"],
+      verification: "npm test",
+    },
+  });
+
+  assert.match(web, /### Project Environment Map/);
+  assert.match(web, /Runtime & Stack.*Node\.js \(ESM\), npm/);
+  assert.match(web, /Git Context.*feature-branch/);
+  assert.match(web, /Suggested Verification.*npm test/);
+});

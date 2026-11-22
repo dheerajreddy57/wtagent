@@ -5,6 +5,7 @@ import {
   parseAgentResponse,
   serializeProtocolError,
   serializeToolResult,
+  serializeToolResults,
 } from "../protocol/xml-protocol.js";
 import {
   appendSystemReminder,
@@ -82,11 +83,14 @@ function deriveToolIdentity({
   turn,
   toolCall,
   turnNumber,
+  callIndex = 0,
 }) {
   const args = canonicalArgs(toolCall.args);
   const messageIdentity = assistantMessageId
-    ? `message:${assistantMessageId}`
-    : `turn:${turnNumber}:${createHash("sha256").update(turn.raw).digest("hex")}`;
+    ? (callIndex === 0 ? `message:${assistantMessageId}` : `message:${assistantMessageId}:${callIndex}`)
+    : (callIndex === 0
+      ? `turn:${turnNumber}:${createHash("sha256").update(turn.raw).digest("hex")}`
+      : `turn:${turnNumber}:${createHash("sha256").update(turn.raw).digest("hex")}:${callIndex}`);
   const operationKey = createHash("sha256")
     .update(sessionId)
     .update("\0")
@@ -616,7 +620,8 @@ export class AgentRuntime {
     return { blockers, transcript, rebuildInstruction };
   }
 
-  buildToolResultMessage(result, { suffix = "" } = {}) {
+  buildToolResultsMessage(results, { suffix = "" } = {}) {
+    const list = Array.isArray(results) ? results : [results];
     const limit = this.limits.maxBrowserToolResultBytes;
     const nonResultBytes = utf8ByteLength(appendSystemReminder(suffix,
       this.nativeImageReceiver ? NATIVE_IMAGE_SYSTEM_REMINDER : DEFAULT_SYSTEM_REMINDER))
@@ -627,26 +632,36 @@ export class AgentRuntime {
         `Tool result metadata leaves fewer than 512 bytes within the ${limit}-byte browser limit.`,
       );
     }
-    return `${serializeToolResult(result, { maxBytes: resultBudget })}${suffix}`;
+    return `${serializeToolResults(list, { maxBytes: resultBudget })}${suffix}`;
   }
 
-  async sendToolResult(result, {
+  buildToolResultMessage(result, options = {}) {
+    return this.buildToolResultsMessage(result, options);
+  }
+
+  async sendToolResults(results, {
     suffix = "",
     runtimeTurn = null,
   } = {}) {
+    const list = Array.isArray(results) ? results : [results];
+    const primary = list[0] ?? {};
     return await this.sendMessage(
-      this.buildToolResultMessage(result, { suffix }),
+      this.buildToolResultsMessage(list, { suffix }),
       {
         maxBytes: this.limits.maxBrowserToolResultBytes,
         outboundKind: "tool_result",
         runtimeTurn,
         pendingToolAcknowledgement: {
-          callId: result.callId ?? null,
-          name: result.name ?? null,
-          operationSignature: result.operationSignature ?? null,
+          callId: primary.callId ?? null,
+          name: primary.name ?? null,
+          operationSignature: primary.operationSignature ?? null,
         },
       },
     );
+  }
+
+  async sendToolResult(result, options = {}) {
+    return await this.sendToolResults([result], options);
   }
 
   // Runs a provider-native helper turn (currently used by image.generate) in
@@ -1804,6 +1819,13 @@ export class AgentRuntime {
         };
       }
 
+      if (parsed.thought) {
+        await this.emit("model.thought", {
+          turn: turnNumber,
+          thought: parsed.thought,
+        });
+      }
+
       if (parsed.message) {
         await this.emit("model.progress", {
           turn: turnNumber,
@@ -1811,7 +1833,11 @@ export class AgentRuntime {
         });
       }
 
-      if (!parsed.toolCall) {
+      const callsToRun = parsed.toolCalls && parsed.toolCalls.length > 0
+        ? parsed.toolCalls
+        : (parsed.toolCall ? [parsed.toolCall] : []);
+
+      if (callsToRun.length === 0) {
         // done=false without a tool call means the model is just talking
         // (e.g. asking a clarifying question, explaining its reasoning, or
         // giving a partial answer). The message was already emitted as
@@ -1831,288 +1857,314 @@ export class AgentRuntime {
         continue;
       }
 
-      const identity = deriveToolIdentity({
-        sessionId: this.session.sessionId,
-        assistantMessageId,
-        turn: parsed,
-        toolCall: parsed.toolCall,
-        turnNumber,
-      });
-      const normalizedCall = {
-        ...parsed.toolCall,
-        id: identity.callId,
-      };
-      let preparedCall;
-      try {
-        preparedCall = this.registry.validate(normalizedCall);
-      } catch (error) {
-        if (!(error instanceof ToolValidationError)) {
-          throw error;
+      const preparedItems = [];
+      for (let callIndex = 0; callIndex < callsToRun.length; callIndex += 1) {
+        const rawCall = callsToRun[callIndex];
+        const identity = deriveToolIdentity({
+          sessionId: this.session.sessionId,
+          assistantMessageId,
+          turn: parsed,
+          toolCall: rawCall,
+          turnNumber,
+          callIndex,
+        });
+        const normalizedCall = {
+          ...rawCall,
+          id: identity.callId,
+        };
+        let preparedCall = null;
+        let validationError = null;
+        try {
+          preparedCall = this.registry.validate(normalizedCall);
+        } catch (error) {
+          if (!(error instanceof ToolValidationError)) {
+            throw error;
+          }
+          validationError = error;
         }
-
-        const result = {
-          callId: normalizedCall.id,
-          name: normalizedCall.name,
-          ok: false,
-          message: error.message,
-        };
-        const fingerprint = identity.fingerprint;
-        await this.emit("tool.invalid", {
-          id: normalizedCall.id,
-          name: normalizedCall.name,
-          message: error.message,
+        preparedItems.push({
+          rawCall,
+          identity,
+          normalizedCall,
+          preparedCall,
+          validationError,
+          result: null,
+          restoredForTool: false,
         });
-        const completionEvent = await this.session.recordToolResult(
-          fingerprint,
-          result,
-        );
-        await this.onEvent?.(completionEvent);
-        // Record the rejected call and its error output so the transcript stays
-        // a faithful, replay-free record of what the model attempted.
-        await this.#appendHandoffTranscript(
-          activeHandoff,
-          "function_call",
-          functionCall({
-            name: normalizedCall.name,
-            args: normalizedCall.args,
-            callId: normalizedCall.id,
-          }),
-        );
-        await this.#appendHandoffTranscript(
-          activeHandoff,
-          "function_output",
-          functionCallOutput({
-            callId: result.callId,
-            output: toolResultOutput(result),
-          }),
-        );
-        await this.sendToolResult(result, { runtimeTurn: turnNumber + 1 });
-        awaitingPendingAcknowledgement = true;
-        await this.emit("tool.result_sent", {
-          id: result.callId,
-          name: result.name,
-          ok: false,
-        });
-        continue;
       }
-      await this.emit("tool.proposed", {
-        id: preparedCall.id,
-        name: preparedCall.name,
-        args: preparedCall.args,
-      });
-      await this.#appendHandoffTranscript(
-        activeHandoff,
-        "function_call",
-        functionCall({
-          name: preparedCall.name,
-          args: preparedCall.args,
-          callId: preparedCall.id,
-        }),
-      );
 
-      const isReadTool = preparedCall.definition.risk === "read";
-      const sideEffect = isReadTool ? null : identity;
-      const fingerprint = identity.fingerprint;
-      let result;
-      let restoredForTool = false;
-
-      if (
-        sideEffect
-        && replayGuard?.signature === identity.requestSignature
-      ) {
-        result = {
-          ...replayGuard.result,
-          callId: preparedCall.id,
-        };
-        await this.emit("tool.reused", {
-          fingerprint,
-          id: preparedCall.id,
-          name: preparedCall.name,
-          reason: "repeated-after-result",
-        });
-        await this.session.setPendingToolResult(result);
-      }
-      // The replay guard is only for the first tool proposal after resending a
-      // persisted result during recovery. Later identical proposals are new
-      // model turns and may be deliberate operations.
-      replayGuard = null;
-
-      if (!result && sideEffect) {
-        const existing = this.session.getSideEffectTool(
-          sideEffect.operationKey,
-        );
-        if (existing && existing.fingerprint !== identity.fingerprint) {
-          result = {
-            callId: preparedCall.id,
-            name: preparedCall.name,
+      for (const item of preparedItems) {
+        if (item.validationError) {
+          item.result = {
+            callId: item.normalizedCall.id,
+            name: item.normalizedCall.name,
             ok: false,
-            message:
-              "The same assistant message changed its tool request after it "
-              + `was already recorded for ${existing.name}. The operation was not replayed.`,
+            message: item.validationError.message,
           };
-          await this.emit("tool.conflict", {
-            id: preparedCall.id,
-            name: preparedCall.name,
-            existingName: existing.name,
+          await this.emit("tool.invalid", {
+            id: item.normalizedCall.id,
+            name: item.normalizedCall.name,
+            message: item.validationError.message,
           });
-          await this.session.setPendingToolResult(result);
-        } else if (existing?.status === "completed") {
-          result = existing.result;
+          const completionEvent = await this.session.recordToolResult(
+            item.identity.fingerprint,
+            item.result,
+          );
+          await this.onEvent?.(completionEvent);
+          await this.#appendHandoffTranscript(
+            activeHandoff,
+            "function_call",
+            functionCall({
+              name: item.normalizedCall.name,
+              args: item.normalizedCall.args,
+              callId: item.normalizedCall.id,
+            }),
+          );
+        } else {
+          await this.emit("tool.proposed", {
+            id: item.preparedCall.id,
+            name: item.preparedCall.name,
+            args: item.preparedCall.args,
+          });
+          await this.#appendHandoffTranscript(
+            activeHandoff,
+            "function_call",
+            functionCall({
+              name: item.preparedCall.name,
+              args: item.preparedCall.args,
+              callId: item.preparedCall.id,
+            }),
+          );
+        }
+      }
+
+      const executeItem = async (item) => {
+        if (item.result) {
+          return;
+        }
+        const { preparedCall, identity } = item;
+        const isReadTool = preparedCall.definition.risk === "read";
+        const sideEffect = isReadTool ? null : identity;
+        const fingerprint = identity.fingerprint;
+        let result;
+        let restoredForTool = false;
+
+        if (
+          sideEffect
+          && replayGuard?.signature === identity.requestSignature
+        ) {
+          result = {
+            ...replayGuard.result,
+            callId: preparedCall.id,
+          };
           await this.emit("tool.reused", {
             fingerprint,
             id: preparedCall.id,
             name: preparedCall.name,
+            reason: "repeated-after-result",
           });
           await this.session.setPendingToolResult(result);
-        } else if (existing) {
-          result = existing.result ?? unknownCompletionResult(preparedCall);
-          if (existing.status !== "unknown") {
+        }
+        replayGuard = null;
+
+        if (!result && sideEffect) {
+          const existing = this.session.getSideEffectTool(
+            sideEffect.operationKey,
+          );
+          if (existing && existing.fingerprint !== identity.fingerprint) {
+            result = {
+              callId: preparedCall.id,
+              name: preparedCall.name,
+              ok: false,
+              message:
+                "The same assistant message changed its tool request after it "
+                + `was already recorded for ${existing.name}. The operation was not replayed.`,
+            };
+            await this.emit("tool.conflict", {
+              id: preparedCall.id,
+              name: preparedCall.name,
+              existingName: existing.name,
+            });
+            await this.session.setPendingToolResult(result);
+          } else if (existing?.status === "completed") {
+            result = existing.result;
+            await this.emit("tool.reused", {
+              fingerprint,
+              id: preparedCall.id,
+              name: preparedCall.name,
+            });
+            await this.session.setPendingToolResult(result);
+          } else if (existing) {
+            result = existing.result ?? unknownCompletionResult(preparedCall);
+            if (existing.status !== "unknown") {
+              const unknownEvent = await this.session.markSideEffectToolUnknown(
+                identity,
+                result,
+              );
+              await this.onEvent?.(unknownEvent);
+            } else {
+              await this.session.setPendingToolResult(result);
+            }
+            await this.emit("tool.reused_unknown", {
+              fingerprint,
+              id: preparedCall.id,
+              name: preparedCall.name,
+            });
+          }
+        } else if (!result) {
+          result = this.session.getToolResult(fingerprint);
+        }
+
+        if (!result) {
+          let decision;
+          try {
+            decision = await this.policy.evaluate(preparedCall, {
+              projectRoot,
+            });
+          } catch (error) {
+            result = policyRejectedResult(preparedCall, error.message);
+            await this.emit("tool.invalid", {
+              id: preparedCall.id,
+              name: preparedCall.name,
+              message: result.message,
+            });
+          }
+          const grants = decision?.grants;
+
+          if (!result && decision.action === "confirm") {
+            await this.emit("approval.required", {
+              id: preparedCall.id,
+              name: preparedCall.name,
+              args: preparedCall.args,
+              reasons: decision.reasons,
+            });
+            const approved = await this.approval({
+              toolCall: preparedCall,
+              reasons: decision.reasons,
+            });
+            if (!approved) {
+              result = deniedResult(preparedCall, decision.reasons);
+            }
+          } else if (!result && decision.action === "deny") {
+            result = policyRejectedResult(
+              preparedCall,
+              decision.reasons.join("; "),
+            );
+            await this.emit("tool.invalid", {
+              id: preparedCall.id,
+              name: preparedCall.name,
+              message: result.message,
+            });
+          }
+
+          if (sideEffect) {
+            const claimEvent = await this.session.claimSideEffectTool(sideEffect);
+            await this.onEvent?.(claimEvent);
+          }
+
+          if (!result) {
+            if (preparedCall.definition.requiresVisibleBrowser) {
+              await this.adapter.restoreWindow?.();
+              restoredForTool = true;
+            }
+            await this.emit("tool.started", {
+              id: preparedCall.id,
+              name: preparedCall.name,
+            });
+            try {
+              result = await this.registry.execute(preparedCall, {
+                projectRoot,
+                allowOutside: grants?.allowOutside ?? false,
+                toolTimeoutMs: this.limits.toolTimeoutMs,
+                sessionId: this.session.sessionId,
+                operationKey: identity.operationKey,
+                requestSignature: identity.requestSignature,
+                runAuxiliaryTurn: (options) => this.runAuxiliaryTurn(options),
+                onToolOutput: async (output) => {
+                  await this.session.appendToolOutput({
+                    id: preparedCall.id,
+                    name: preparedCall.name,
+                    ...output,
+                  });
+                  await this.onEvent?.({
+                    type: "tool.output",
+                    sessionId: this.session.sessionId,
+                    timestamp: new Date().toISOString(),
+                    payload: {
+                      id: preparedCall.id,
+                      name: preparedCall.name,
+                      ...output,
+                    },
+                  });
+                },
+              });
+            } finally {
+              if (restoredForTool) {
+                await this.adapter.page?.bringToFront?.().catch(() => null);
+              }
+            }
+          }
+
+          if (sideEffect) {
+            result.operationSignature = identity.requestSignature;
+          }
+
+          if (sideEffect && result.meta?.completionUnknown) {
             const unknownEvent = await this.session.markSideEffectToolUnknown(
-              identity,
+              sideEffect,
               result,
             );
             await this.onEvent?.(unknownEvent);
           } else {
-            await this.session.setPendingToolResult(result);
-          }
-          await this.emit("tool.reused_unknown", {
-            fingerprint,
-            id: preparedCall.id,
-            name: preparedCall.name,
-          });
-        }
-      } else if (!result) {
-        result = this.session.getToolResult(fingerprint);
-      }
-
-      if (!result) {
-        let decision;
-        try {
-          decision = await this.policy.evaluate(preparedCall, {
-            projectRoot,
-          });
-        } catch (error) {
-          result = policyRejectedResult(preparedCall, error.message);
-          await this.emit("tool.invalid", {
-            id: preparedCall.id,
-            name: preparedCall.name,
-            message: result.message,
-          });
-        }
-        const grants = decision?.grants;
-
-        if (!result && decision.action === "confirm") {
-          await this.emit("approval.required", {
-            id: preparedCall.id,
-            name: preparedCall.name,
-            args: preparedCall.args,
-            reasons: decision.reasons,
-          });
-          const approved = await this.approval({
-            toolCall: preparedCall,
-            reasons: decision.reasons,
-          });
-          if (!approved) {
-            result = deniedResult(preparedCall, decision.reasons);
-          }
-        } else if (!result && decision.action === "deny") {
-          result = policyRejectedResult(
-            preparedCall,
-            decision.reasons.join("; "),
-          );
-          await this.emit("tool.invalid", {
-            id: preparedCall.id,
-            name: preparedCall.name,
-            message: result.message,
-          });
-        }
-
-        if (sideEffect) {
-          const claimEvent = await this.session.claimSideEffectTool(sideEffect);
-          await this.onEvent?.(claimEvent);
-        }
-
-        if (!result) {
-          if (preparedCall.definition.requiresVisibleBrowser) {
-            await this.adapter.restoreWindow?.();
-            restoredForTool = true;
-          }
-          await this.emit("tool.started", {
-            id: preparedCall.id,
-            name: preparedCall.name,
-          });
-          try {
-            result = await this.registry.execute(preparedCall, {
-              projectRoot,
-              allowOutside: grants?.allowOutside ?? false,
-              toolTimeoutMs: this.limits.toolTimeoutMs,
-              sessionId: this.session.sessionId,
-              operationKey: identity.operationKey,
-              requestSignature: identity.requestSignature,
-              runAuxiliaryTurn: (options) => this.runAuxiliaryTurn(options),
-              onToolOutput: async (output) => {
-                await this.session.appendToolOutput({
-                  id: preparedCall.id,
-                  name: preparedCall.name,
-                  ...output,
-                });
-                await this.onEvent?.({
-                  type: "tool.output",
-                  sessionId: this.session.sessionId,
-                  timestamp: new Date().toISOString(),
-                  payload: {
-                    id: preparedCall.id,
-                    name: preparedCall.name,
-                    ...output,
-                  },
-                });
-              },
-            });
-          } finally {
-            if (restoredForTool) {
-              await this.adapter.page?.bringToFront?.().catch(() => null);
-            }
+            const completionEvent = await this.session.recordToolResult(
+              fingerprint,
+              result,
+              { identity: sideEffect },
+            );
+            await this.onEvent?.(completionEvent);
           }
         }
 
-        if (sideEffect) {
-          result.operationSignature = identity.requestSignature;
-        }
+        item.result = result;
+        item.restoredForTool = restoredForTool;
+      };
 
-        if (sideEffect && result.meta?.completionUnknown) {
-          const unknownEvent = await this.session.markSideEffectToolUnknown(
-            sideEffect,
-            result,
-          );
-          await this.onEvent?.(unknownEvent);
-        } else {
-          const completionEvent = await this.session.recordToolResult(
-            fingerprint,
-            result,
-            { identity: sideEffect },
-          );
-          await this.onEvent?.(completionEvent);
+      const validItems = preparedItems.filter((item) => !item.result);
+      const allReadOnly = validItems.length > 0
+        && validItems.every((item) => item.preparedCall?.definition?.risk === "read");
+
+      if (allReadOnly) {
+        await Promise.all(validItems.map((item) => executeItem(item)));
+      } else {
+        for (const item of validItems) {
+          await executeItem(item);
         }
       }
 
       this.#assertProviderReadyForMessage();
 
-      await this.#appendHandoffTranscript(
-        activeHandoff,
-        "function_output",
-        functionCallOutput({
-          callId: result.callId,
-          output: toolResultOutput(result),
-        }),
-      );
-      await this.sendToolResult(result, { runtimeTurn: turnNumber + 1 });
+      for (const item of preparedItems) {
+        await this.#appendHandoffTranscript(
+          activeHandoff,
+          "function_output",
+          functionCallOutput({
+            callId: item.result.callId,
+            output: toolResultOutput(item.result),
+          }),
+        );
+      }
+
+      const allResults = preparedItems.map((item) => item.result);
+      await this.sendToolResults(allResults, { runtimeTurn: turnNumber + 1 });
       awaitingPendingAcknowledgement = true;
-      await this.emit("tool.result_sent", {
-        id: result.callId,
-        name: result.name,
-        ok: result.ok,
-      });
-      if (restoredForTool) {
+      for (const res of allResults) {
+        await this.emit("tool.result_sent", {
+          id: res.callId,
+          name: res.name,
+          ok: res.ok,
+        });
+      }
+      if (preparedItems.some((item) => item.restoredForTool)) {
         await this.adapter.minimizeWindow?.();
       }
     }

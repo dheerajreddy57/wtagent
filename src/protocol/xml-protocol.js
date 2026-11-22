@@ -65,19 +65,42 @@ function escapeBareAmpersands(text) {
 }
 
 function closeDanglingToolCall(envelope) {
-  const tags = [...xmlTags(envelope)].filter((tag) => tag.name === "tool_call");
-  const open = tags.filter((tag) => !tag.closing && !tag.selfClosing).length;
-  const close = tags.filter((tag) => tag.closing).length;
-  if (open !== close + 1) {
-    return envelope;
+  let text = envelope;
+  const tcTags = [...xmlTags(text)].filter((tag) => tag.name === "tool_call");
+  const tcOpen = tcTags.filter((tag) => !tag.closing && !tag.selfClosing).length;
+  const tcClose = tcTags.filter((tag) => tag.closing).length;
+  if (tcOpen === tcClose + 1) {
+    text = text.replace(
+      /(<\/args>\s*)(<\/tool_calls>\s*<\/agent_response>\s*|<\/agent_response>\s*)$/i,
+      "$1</tool_call>\n$2",
+    );
   }
-  return envelope.replace(
-    /(<\/args>\s*)(<\/agent_response>\s*)$/i,
-    "$1</tool_call>\n$2",
-  );
+  const tcsTags = [...xmlTags(text)].filter((tag) => tag.name === "tool_calls");
+  const tcsOpen = tcsTags.filter((tag) => !tag.closing && !tag.selfClosing).length;
+  const tcsClose = tcsTags.filter((tag) => tag.closing).length;
+  if (tcsOpen === tcsClose + 1) {
+    text = text.replace(
+      /(<\/tool_call>\s*)(<\/agent_response>\s*)$/i,
+      "$1</tool_calls>\n$2",
+    );
+  }
+  return text;
 }
 
 function wrapBareToolCall(text) {
+  const callsBounds = findXmlElement(text, "tool_calls");
+  if (callsBounds?.end != null) {
+    const toolCalls = text.slice(callsBounds.start, callsBounds.end);
+    if (/<tool_call[\s>/]/i.test(toolCalls)) {
+      return [
+        "<agent_response>",
+        "  <done>false</done>",
+        "  <message></message>",
+        `  ${toolCalls}`,
+        "</agent_response>",
+      ].join("\n");
+    }
+  }
   const bounds = findXmlElement(text, "tool_call");
   if (bounds?.end != null) {
     const toolCall = text.slice(bounds.start, bounds.end);
@@ -343,9 +366,11 @@ function recoverMessageOnlyResponse(envelope) {
   const closing = tags.findLast((tag) => tag.name === "agent_response" && tag.closing);
   const siblings = envelope.slice(root.end, closing.start)
     .replace(/<done(?:\s[^>]*)?>[\s\S]*?<\/done>/g, "")
+    .replace(/<thought(?:\s[^>]*)?>[\s\S]*?<\/thought>/g, "")
     .replace(/<message(?:\s[^>]*)?>[\s\S]*?<\/message>/g, "");
   if (siblings.trim()) return null;
   const doneText = looseTagText(envelope, "done");
+  const thought = looseTagText(envelope, "thought");
   const message = looseTagText(envelope, "message");
   if (doneText == null || message == null) {
     return null;
@@ -359,8 +384,10 @@ function recoverMessageOnlyResponse(envelope) {
   }
   return {
     done: done === "true",
+    thought,
     message,
     toolCall: null,
+    toolCalls: [],
     raw: envelope,
     recovered: true,
   };
@@ -417,42 +444,62 @@ export function parseAgentResponse(rawText) {
   if (!response || typeof response !== "object" || Array.isArray(response)) {
     throw new ProtocolError("Missing <agent_response> root.");
   }
-  if (["action", "invoke", "tool_calls"].some((name) => response[name] != null)) {
-    throw new ProtocolError("Operations must use one <tool_call> element with <args>.");
+  if (["action", "invoke"].some((name) => response[name] != null)) {
+    throw new ProtocolError("Operations must use <tool_call> elements with <args>.");
   }
 
   const done = parseDone(response.done);
+  let thought = null;
+  if (response.thought != null) {
+    const t = scalarText(response.thought);
+    if (t) {
+      thought = t;
+    }
+  }
   const message = scalarText(response.message);
-  const rawToolCall = response.tool_call;
 
-  if (Array.isArray(rawToolCall)) {
-    throw new ProtocolError("V1 allows at most one <tool_call> per turn.");
+  const rawCalls = [];
+  if (response.tool_call != null && response.tool_call !== "") {
+    if (Array.isArray(response.tool_call)) {
+      rawCalls.push(...response.tool_call);
+    } else {
+      rawCalls.push(response.tool_call);
+    }
+  }
+  if (response.tool_calls != null && response.tool_calls !== "") {
+    const inner = response.tool_calls.tool_call;
+    if (inner != null && inner !== "") {
+      if (Array.isArray(inner)) {
+        rawCalls.push(...inner);
+      } else {
+        rawCalls.push(inner);
+      }
+    }
   }
 
-  let toolCall = null;
-  if (rawToolCall != null && rawToolCall !== "") {
-    if (typeof rawToolCall !== "object") {
+  const toolCalls = rawCalls.map((raw) => {
+    if (typeof raw !== "object" || raw == null) {
       throw new ProtocolError("<tool_call> must contain a name and args.");
     }
-
-    const name = String(rawToolCall.name ?? "").trim();
+    const name = String(raw.name ?? "").trim();
     if (!name) {
       throw new ProtocolError("<tool_call> is missing the name attribute.");
     }
-
     const normalizedArgs = normalizeXmlValue(
-      rawToolCall.args ?? rawToolCall.arguments ?? {},
+      raw.args ?? raw.arguments ?? {},
     );
-    toolCall = {
-      id: String(rawToolCall.id ?? "").trim() || null,
+    return {
+      id: String(raw.id ?? "").trim() || null,
       name,
       args: typeof normalizedArgs === "string" && !normalizedArgs.trim()
         ? {}
         : normalizedArgs,
     };
-  }
+  });
 
-  if (done && toolCall) {
+  const toolCall = toolCalls.length > 0 ? toolCalls[0] : null;
+
+  if (done && toolCalls.length > 0) {
     throw new ProtocolError(
       "A completed response cannot also request a tool. Use done=false.",
     );
@@ -460,8 +507,10 @@ export function parseAgentResponse(rawText) {
 
   return {
     done,
+    thought,
     message,
     toolCall,
+    toolCalls,
     raw: envelope,
   };
 }
@@ -580,6 +629,18 @@ export function serializeToolResult(result, { maxBytes = Infinity } = {}) {
     throw new RangeError(`Unable to fit tool result within ${maxBytes} bytes.`);
   }
   return xml;
+}
+
+export function serializeToolResults(results, { maxBytes = Infinity } = {}) {
+  const list = Array.isArray(results) ? results : [results];
+  if (list.length === 0) return "";
+  if (list.length === 1) {
+    return serializeToolResult(list[0], { maxBytes });
+  }
+  const perResultBudget = Number.isFinite(maxBytes)
+    ? Math.floor(maxBytes / list.length)
+    : Infinity;
+  return list.map((res) => serializeToolResult(res, { maxBytes: perResultBudget })).join("\n");
 }
 
 export function serializeProtocolError(error) {

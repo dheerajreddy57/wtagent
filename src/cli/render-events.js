@@ -189,6 +189,10 @@ export class Renderer {
 
   // ---- semantic renderers ------------------------------------------------
 
+  #thought(message) {
+    this.println(`${this.#hdr()} ${DIM}💭 ${truncate(message, 300)}${RESET}`);
+  }
+
   #progress(message) {
     this.println(`${this.#hdr()} ${DIM}·${RESET} ${truncate(message, 300)}`);
   }
@@ -322,6 +326,12 @@ export class Renderer {
         this.note(t("renderer.limitReached", {
           provider: this.providerLabel,
         }));
+        break;
+      case "model.thought":
+        this.stopSpinner();
+        if (payload.thought) {
+          this.#thought(payload.thought);
+        }
         break;
       case "model.progress":
         this.stopSpinner();

@@ -6,6 +6,7 @@ import {
   parseAgentResponse,
   serializeProtocolError,
   serializeToolResult,
+  serializeToolResults,
   stripUiNoiseLines,
 } from "../src/protocol/xml-protocol.js";
 
@@ -407,4 +408,90 @@ test("raw-code XML errors carry CDATA guidance", () => {
   );
   assert.match(xml, /Wrap ALL code and file content in CDATA/);
   assert.match(xml, /SMALL fs\.edit calls/);
+});
+
+test("parses thought reasoning blocks in agent response", () => {
+  const xml = `
+<agent_response>
+  <done>false</done>
+  <thought>Need to check package.json before deciding on module format.</thought>
+  <message>Reading package.json</message>
+  <tool_call name="fs.read">
+    <args><path>package.json</path></args>
+  </tool_call>
+</agent_response>
+`;
+  const parsed = parseAgentResponse(xml);
+  assert.equal(parsed.thought, "Need to check package.json before deciding on module format.");
+  assert.equal(parsed.message, "Reading package.json");
+  assert.equal(parsed.toolCall.name, "fs.read");
+  assert.equal(parsed.toolCalls.length, 1);
+});
+
+test("parses multiple batch tool_call elements in a single turn", () => {
+  const xml = `
+<agent_response>
+  <done>false</done>
+  <thought>Batch read index and package config simultaneously.</thought>
+  <message>Reading files in parallel.</message>
+  <tool_call name="fs.read">
+    <args><path>package.json</path></args>
+  </tool_call>
+  <tool_call name="fs.read">
+    <args><path>src/index.js</path></args>
+  </tool_call>
+</agent_response>
+`;
+  const parsed = parseAgentResponse(xml);
+  assert.equal(parsed.done, false);
+  assert.equal(parsed.toolCalls.length, 2);
+  assert.equal(parsed.toolCall.name, "fs.read");
+  assert.equal(parsed.toolCalls[0].args.path, "package.json");
+  assert.equal(parsed.toolCalls[1].args.path, "src/index.js");
+});
+
+test("parses tool_calls container tag with multiple tool_call children", () => {
+  const xml = `
+<agent_response>
+  <done>false</done>
+  <message>Batch tools.</message>
+  <tool_calls>
+    <tool_call name="fs.read">
+      <args><path>a.txt</path></args>
+    </tool_call>
+    <tool_call name="fs.read">
+      <args><path>b.txt</path></args>
+    </tool_call>
+  </tool_calls>
+</agent_response>
+`;
+  const parsed = parseAgentResponse(xml);
+  assert.equal(parsed.done, false);
+  assert.equal(parsed.toolCalls.length, 2);
+  assert.equal(parsed.toolCalls[0].args.path, "a.txt");
+  assert.equal(parsed.toolCalls[1].args.path, "b.txt");
+});
+
+test("serializes multiple tool results with serializeToolResults", () => {
+  const results = [
+    { name: "fs.read", ok: true, message: "Read a.txt", data: "content a" },
+    { name: "fs.read", ok: true, message: "Read b.txt", data: "content b" },
+  ];
+  const serialized = serializeToolResults(results);
+  assert.match(serialized, /<tool_result name="fs\.read" status="ok">[\s\S]*content a[\s\S]*<\/tool_result>/);
+  assert.match(serialized, /<tool_result name="fs\.read" status="ok">[\s\S]*content b[\s\S]*<\/tool_result>/);
+});
+
+test("wraps bare tool_calls container block", () => {
+  const bare = `
+<tool_calls>
+  <tool_call name="fs.list">
+    <args><path>.</path></args>
+  </tool_call>
+</tool_calls>
+`;
+  const parsed = parseAgentResponse(bare);
+  assert.equal(parsed.done, false);
+  assert.equal(parsed.toolCalls.length, 1);
+  assert.equal(parsed.toolCall.name, "fs.list");
 });
